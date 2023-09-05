@@ -63,8 +63,16 @@ pub trait PacketHandler: Send + Sync + Sized + 'static {
 /// Fast UDP I/O engine.
 pub struct Engine<H: PacketHandler> {
     threads: Vec<Arc<EngineThread<H>>>,
-    bound: Mutex<HashSet<InetAddress>>,
 }
+
+/// Global set of bound local addresses since with SO_REUSEPORT we can't use failure to bind to
+/// determine if an address is already in use by our own process.
+///
+/// It needs to be global in case multiple engine instances are created.
+///
+/// This is populated on bind(). Addresses are removed on close() or within threads during
+/// engine shutdown.
+static BOUND_LOCAL_ADDRESSES: Mutex<Option<HashSet<InetAddress>>> = Mutex::new(None);
 
 /// Bound UDP socket handle.
 ///
@@ -148,7 +156,6 @@ impl<H: PacketHandler> Engine<H> {
                 }
                 threads
             },
-            bound: Mutex::new(HashSet::new()),
         }
     }
 
@@ -176,8 +183,9 @@ impl<H: PacketHandler> Engine<H> {
         // Counter used to assign each UdpSocket an internally unique ID.
         static ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
-        let mut bound = self.bound.lock().unwrap(); // also serializes calls to bind()
-        if bound.contains(bind_address) {
+        let mut bound = BOUND_LOCAL_ADDRESSES.lock().unwrap(); // also serializes calls to bind()
+
+        if bound.as_ref().map_or(false, |b| b.contains(bind_address)) {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::AddrNotAvailable,
                 "already bound to this address",
@@ -201,7 +209,7 @@ impl<H: PacketHandler> Engine<H> {
         }
 
         let id = ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-        bound.insert(bind_address.clone());
+        bound.get_or_insert_with(|| HashSet::new()).insert(bind_address.clone());
 
         for (t, fd) in self.threads.iter().zip(fds.iter()) {
             t.commands.lock().unwrap().push(ThreadCommand::Open(UdpSocket {
@@ -228,7 +236,12 @@ impl<H: PacketHandler> Engine<H> {
     /// Note that it's possible for a few packets to continue to be received on this socket
     /// until all threads have had a chance to receive a close command for it.
     pub fn close(&self, socket: UdpSocket<H>) {
-        if self.bound.lock().unwrap().remove(&socket.local_address) {
+        if BOUND_LOCAL_ADDRESSES
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map_or(false, |b| b.remove(&socket.local_address))
+        {
             for t in self.threads.iter() {
                 t.commands.lock().unwrap().push(ThreadCommand::Close(socket.id));
                 let _ = t.poller.notify();
@@ -326,7 +339,9 @@ impl<H: PacketHandler> EngineThread<H> {
                         }
                     }),
                     ThreadCommand::Shutdown => {
+                        let mut bound = BOUND_LOCAL_ADDRESSES.lock().unwrap();
                         for d in sockets.iter() {
+                            bound.as_mut().map(|b| b.remove(&d.local_address));
                             unsafe { libc::close(d.fd) };
                         }
                         return;
