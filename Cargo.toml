@@ -1,0 +1,15 @@
+[package]
+authors = ["ZeroTier, Inc. <contact@zerotier.com>"]
+edition = "2021"
+license = "MPL-2.0"
+name = "udwee"
+version = "0.0.1"
+
+[dependencies]
+num-traits = "^0"
+zerotier-common-utils = { git = "https://github.com/zerotier/common-utils.git", branch = "main" }
+core_affinity = "^0"
+polling = "^2"
+
+[target."cfg(not(windows))".dependencies]
+libc = "^0"
