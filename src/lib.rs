@@ -45,9 +45,11 @@ pub trait PacketHandler: Send + Sync + Sized + 'static {
 
     /// Obtain a buffer to receive a new packet.
     ///
-    /// The buffer's contents do not need to be zeroed prior to being used. Its as_mut() function
-    /// must return a slice large enough to receive a UDP packet or packets will be lost.
-    fn get_buffer(&self) -> Self::Buffer;
+    /// Receive buffers must be sized to accept the largest possible UDP packet or packets may
+    /// be lost. In other words if the buffer is e.g. a Vec<u8> its size must be set with
+    /// resize() prior to returning from this so that as_mut() will return a destination buffer
+    /// for reading. The buffer does not need to be cleared as any data will be overwritten.
+    fn get_receive_buffer(&self) -> Self::Buffer;
 
     /// Called by the engine to return a buffer after a send completes (or fails).
     ///
@@ -55,9 +57,12 @@ pub trait PacketHandler: Send + Sync + Sized + 'static {
     /// If you are doing pooling you could instead call this internally inside on_udp_packet when
     /// processing is complete.
     ///
-    /// The default implementation is a no-op. Override if needed to e.g. return buffers to a pool.
-    #[allow(unused_variables)]
-    fn return_buffer(&self, buffer: Self::Buffer) {}
+    /// The default implementation just drops. Override if anything needs to be done with used
+    /// buffers other than dropping them.
+    #[inline(always)]
+    fn return_buffer(&self, buffer: Self::Buffer) {
+        drop(buffer);
+    }
 
     /// Called whan a UDP packet is received.
     ///
@@ -292,7 +297,7 @@ impl<H: PacketHandler> EngineThread<H> {
                             let d: &UdpSocket<H> = unsafe { &*(*key as *const UdpSocket<H>) };
                             let handler = d.handler.as_ref();
                             loop {
-                                let mut buf = handler.get_buffer();
+                                let mut buf = handler.get_receive_buffer();
                                 let buf_inner = buf.as_mut();
                                 let mut addrlen = size_of::<InetAddress>() as libc::socklen_t;
                                 let packet_size = unsafe {
@@ -390,33 +395,23 @@ impl<H: PacketHandler> UdpSocket<H> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+    use zerotier_common_utils::buf::Buf;
 
     #[derive(Default)]
     struct TestHandler {
-        pool: Mutex<Vec<Box<[u8]>>>,
         received: AtomicU64,
         echo: bool,
     }
 
     impl PacketHandler for TestHandler {
-        type Buffer = Box<[u8]>;
+        type Buffer = Buf;
         type Ref = Arc<Self>;
         type SocketApplicationData = ();
 
-        fn get_buffer(&self) -> Self::Buffer {
-            let mut pool = self.pool.lock().unwrap();
-            if pool.is_empty() {
-                drop(pool);
-                let mut v = Vec::new();
-                v.resize(2048, 0);
-                v.into_boxed_slice()
-            } else {
-                pool.pop().unwrap()
-            }
-        }
-
-        fn return_buffer(&self, buffer: Self::Buffer) {
-            self.pool.lock().unwrap().push(buffer);
+        fn get_receive_buffer(&self) -> Self::Buffer {
+            let mut b = Buf::new(1504);
+            unsafe { b.set_size(1500) };
+            b
         }
 
         fn on_udp_packet(
@@ -440,11 +435,7 @@ mod tests {
     fn loopback() {
         let eng = Engine::<TestHandler>::new();
 
-        let sender_handler = Arc::new(TestHandler {
-            pool: Mutex::new(Vec::new()),
-            received: AtomicU64::new(0),
-            echo: false,
-        });
+        let sender_handler = Arc::new(TestHandler { received: AtomicU64::new(0), echo: false });
         let sender = eng
             .bind(
                 &InetAddress::from_ip_port(&[127, 0, 0, 1], 11111),
@@ -455,11 +446,7 @@ mod tests {
             )
             .unwrap();
 
-        let receiver_handler = Arc::new(TestHandler {
-            pool: Mutex::new(Vec::new()),
-            received: AtomicU64::new(0),
-            echo: true,
-        });
+        let receiver_handler = Arc::new(TestHandler { received: AtomicU64::new(0), echo: true });
         let sendto_addr = InetAddress::from_ip_port(&[127, 0, 0, 1], 11112);
         let _receiver = eng
             .bind(&sendto_addr, None, true, receiver_handler.clone(), ())
@@ -467,7 +454,7 @@ mod tests {
 
         const PACKET_COUNT: usize = 1024;
         for _ in 0..PACKET_COUNT {
-            let mut b = sender_handler.get_buffer();
+            let mut b = sender_handler.get_receive_buffer();
             b.as_mut().fill(1);
             sender.send(&sendto_addr, b, 1024);
         }
